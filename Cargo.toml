@@ -1,0 +1,9 @@
+[package]
+name = "hurlbench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+curl = "0.4.49"
+hurl_core = "7.1.0"
