@@ -308,18 +308,23 @@ fn main() -> Result<()> {
             write!(stderr, "\x1b[s")?;
 
             let mut prev_request_count: usize = 0;
+            let mut prev_instant = time::Instant::now();
             loop {
                 write!(stderr, "\x1b[u\x1b[0J")?;
                 let current_request_count = statistics.lock().unwrap().request_count();
-                let string = format!(
-                    "({:.1}/{:.1}) [{:.1}kRPS] {}",
+                let rps = ((current_request_count - prev_request_count) as f32)
+                    / prev_instant.elapsed().as_secs_f32();
+
+                prev_instant = time::Instant::now();
+                prev_request_count = current_request_count;
+                write!(
+                    stderr,
+                    "({:.1}/{:.1}) [{}rps] {}",
                     start_instant.elapsed().as_secs_f32(),
                     cmd_args.duration.as_secs_f32(),
-                    (current_request_count - prev_request_count) as f32 / 1000.0,
+                    rps as usize,
                     statistics.lock().unwrap()
-                );
-                stderr.write_all(string.as_bytes())?;
-                prev_request_count = current_request_count;
+                )?;
                 thread::sleep(time::Duration::from_secs(1));
             }
         }
