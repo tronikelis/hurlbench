@@ -196,6 +196,10 @@ impl Statistics {
         }
     }
 
+    fn request_count(&self) -> usize {
+        self.max_duration.len()
+    }
+
     fn track(&mut self, duration: time::Duration) {
         self.max_duration.push(duration);
         self.min_duration.push(cmp::Reverse(duration));
@@ -302,15 +306,20 @@ fn main() -> Result<()> {
         move || -> Result<()> {
             let mut stderr = io::stderr();
             write!(stderr, "\x1b[s")?;
+
+            let mut prev_request_count: usize = 0;
             loop {
                 write!(stderr, "\x1b[u\x1b[0J")?;
+                let current_request_count = statistics.lock().unwrap().request_count();
                 let string = format!(
-                    "({:.1}/{:.1}) {}",
+                    "({:.1}/{:.1}) [{:.1}kRPS] {}",
                     start_instant.elapsed().as_secs_f32(),
                     cmd_args.duration.as_secs_f32(),
+                    (current_request_count - prev_request_count) as f32 / 1000.0,
                     statistics.lock().unwrap()
                 );
                 stderr.write_all(string.as_bytes())?;
+                prev_request_count = current_request_count;
                 thread::sleep(time::Duration::from_secs(1));
             }
         }
