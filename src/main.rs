@@ -183,9 +183,70 @@ impl fmt::Display for CmdArgs {
     }
 }
 
+#[derive(Debug)]
+struct PLatencyBucket {
+    count: usize,
+    max_ms: f32,
+}
+
+#[derive(Debug)]
+struct PLatency {
+    buckets: Vec<PLatencyBucket>,
+    total: usize,
+}
+
+impl PLatency {
+    fn new(bucket_count: usize, granularity: f32, exp: f32) -> Self {
+        Self {
+            buckets: (1..=bucket_count)
+                .map(|i| PLatencyBucket {
+                    count: 0,
+                    max_ms: (i as f32 * granularity) * exp.powf(i as f32),
+                })
+                .collect(),
+            total: 0,
+        }
+    }
+
+    fn track(&mut self, duration: time::Duration) {
+        self.total += 1;
+
+        let ms = duration.as_secs_f32() * 1000.0;
+        for bucket in self.buckets.iter_mut().rev() {
+            if bucket.max_ms <= ms {
+                bucket.count += 1;
+                return;
+            }
+        }
+
+        if let Some(bucket) = self.buckets.first_mut() {
+            bucket.count += 1;
+        }
+    }
+
+    fn p_ms(&self, percent: f32) -> f32 {
+        let mut count = 0;
+        for (i, bucket) in self.buckets.iter().enumerate() {
+            count += bucket.count;
+            if ((count as f32 / self.total as f32) * 100.0) >= percent {
+                if i == 0 {
+                    return bucket.max_ms;
+                }
+
+                let last_bucket = self.buckets.get(i - 1).unwrap();
+                return (last_bucket.max_ms + bucket.max_ms) / 2.0;
+            }
+        }
+
+        0.0
+    }
+}
+
+#[derive(Debug)]
 struct Statistics {
     max_duration: BinaryHeap<time::Duration>,
     min_duration: BinaryHeap<cmp::Reverse<time::Duration>>,
+    platency: PLatency,
 }
 
 impl Statistics {
@@ -193,6 +254,7 @@ impl Statistics {
         Self {
             max_duration: BinaryHeap::new(),
             min_duration: BinaryHeap::new(),
+            platency: PLatency::new(800, 0.5, 1.005),
         }
     }
 
@@ -203,6 +265,7 @@ impl Statistics {
     fn track(&mut self, duration: time::Duration) {
         self.max_duration.push(duration);
         self.min_duration.push(cmp::Reverse(duration));
+        self.platency.track(duration);
     }
 
     fn get_max_duration(&self) -> Option<time::Duration> {
@@ -212,18 +275,6 @@ impl Statistics {
     fn get_min_duration(&self) -> Option<time::Duration> {
         self.min_duration.peek().map(|v| v.0.clone())
     }
-
-    // 99
-    // 99.9
-    // 50
-    fn p(&self, value: f32) -> Option<time::Duration> {
-        let index = (self.max_duration.len() as f32 * (1.0 - value / 100.0)) as usize;
-        let vec = self.max_duration.clone().into_sorted_vec();
-        if vec.len() == 0 {
-            return None;
-        }
-        vec.get(vec.len() - index - 1).map(|v| v.clone())
-    }
 }
 
 impl fmt::Display for Statistics {
@@ -231,17 +282,17 @@ impl fmt::Display for Statistics {
         let default_duration = time::Duration::from_secs(0);
         write!(
             f,
-            "max: {:.4}s, min: {:.4}s, p99.9: {:.4}s, p99: {:.4}s, p95: {:.4}s, p50: {:.4}s",
+            "max: {:.4}s\nmin: {:.4}s\np99.9: {:.4}s\np99: {:.4}s\np95: {:.4}s\np50: {:.4}s",
             self.get_max_duration()
                 .unwrap_or(default_duration)
                 .as_secs_f32(),
             self.get_min_duration()
                 .unwrap_or(default_duration)
                 .as_secs_f32(),
-            self.p(99.9).unwrap_or(default_duration).as_secs_f32(),
-            self.p(99.0).unwrap_or(default_duration).as_secs_f32(),
-            self.p(95.0).unwrap_or(default_duration).as_secs_f32(),
-            self.p(50.0).unwrap_or(default_duration).as_secs_f32(),
+            self.platency.p_ms(99.9) / 1000.0,
+            self.platency.p_ms(99.0) / 1000.0,
+            self.platency.p_ms(95.0) / 1000.0,
+            self.platency.p_ms(50.0) / 1000.0,
         )
     }
 }
@@ -319,7 +370,7 @@ fn main() -> Result<()> {
                 prev_request_count = current_request_count;
                 write!(
                     stderr,
-                    "({:.1}/{:.1}) [{}rps] {}",
+                    "({:.1}/{:.1}) [{}rps]\n{}\n",
                     start_instant.elapsed().as_secs_f32(),
                     cmd_args.duration.as_secs_f32(),
                     rps as usize,
