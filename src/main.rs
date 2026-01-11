@@ -82,7 +82,7 @@ impl Endpoint {
         Ok(list)
     }
 
-    fn send_request(&self, client: &mut curl::easy::Easy) -> Result<()> {
+    fn send_request(&self, client: &mut curl::easy::Easy) -> Result<u32> {
         client.url(&self.url)?;
         client.http_headers(self.create_header_list()?)?;
         match self.method.as_str() {
@@ -93,8 +93,7 @@ impl Endpoint {
         }?;
 
         client.perform()?;
-
-        Ok(())
+        Ok(client.response_code()?)
     }
 }
 
@@ -243,10 +242,42 @@ impl PLatency {
 }
 
 #[derive(Debug)]
+struct RequestStatusCount(Vec<(usize, usize)>);
+
+impl RequestStatusCount {
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    fn track(&mut self, status: usize) {
+        for count in self.0.iter_mut() {
+            if count.0 == status {
+                count.1 += 1;
+                return;
+            }
+        }
+
+        self.0.push((status, 1));
+        self.0.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    }
+}
+
+impl fmt::Display for RequestStatusCount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut string = String::new();
+        for v in &self.0 {
+            string.push_str(&format!("{}: {}\n", v.0, v.1));
+        }
+        write!(f, "{}", string)
+    }
+}
+
+#[derive(Debug)]
 struct Statistics {
     max_duration: BinaryHeap<time::Duration>,
     min_duration: BinaryHeap<cmp::Reverse<time::Duration>>,
     platency: PLatency,
+    request_status_count: RequestStatusCount,
 }
 
 impl Statistics {
@@ -255,6 +286,7 @@ impl Statistics {
             max_duration: BinaryHeap::new(),
             min_duration: BinaryHeap::new(),
             platency: PLatency::new(800, 0.5, 1.005),
+            request_status_count: RequestStatusCount::new(),
         }
     }
 
@@ -262,10 +294,11 @@ impl Statistics {
         self.max_duration.len()
     }
 
-    fn track(&mut self, duration: time::Duration) {
-        self.max_duration.push(duration);
-        self.min_duration.push(cmp::Reverse(duration));
-        self.platency.track(duration);
+    fn track(&mut self, response: Response) {
+        self.max_duration.push(response.duration);
+        self.min_duration.push(cmp::Reverse(response.duration));
+        self.platency.track(response.duration);
+        self.request_status_count.track(response.status);
     }
 
     fn get_max_duration(&self) -> Option<time::Duration> {
@@ -282,7 +315,7 @@ impl fmt::Display for Statistics {
         let default_duration = time::Duration::from_secs(0);
         write!(
             f,
-            "max: {:.4}s\nmin: {:.4}s\np99.9: {:.4}s\np99: {:.4}s\np95: {:.4}s\np50: {:.4}s",
+            "max: {:.4}s\nmin: {:.4}s\np99.9: {:.4}s\np99: {:.4}s\np95: {:.4}s\np50: {:.4}s\nstatuses:\n{}",
             self.get_max_duration()
                 .unwrap_or(default_duration)
                 .as_secs_f32(),
@@ -293,8 +326,14 @@ impl fmt::Display for Statistics {
             self.platency.p_ms(99.0) / 1000.0,
             self.platency.p_ms(95.0) / 1000.0,
             self.platency.p_ms(50.0) / 1000.0,
+            self.request_status_count,
         )
     }
+}
+
+struct Response {
+    duration: time::Duration,
+    status: usize,
 }
 
 fn main() -> Result<()> {
@@ -325,22 +364,22 @@ fn main() -> Result<()> {
     );
     eprintln!("endpoint: {}", &endpoint);
 
-    let (request_tx, request_rx) = sync::mpsc::channel::<Result<time::Duration>>();
+    let (response_tx, response_rx) = sync::mpsc::channel::<Result<Response>>();
 
     let mut thread_handles = Vec::new();
     for _ in 0..cmd_args.parrallelism {
         thread_handles.push(thread::spawn({
             let endpoint = endpoint.clone();
-            let request_tx = request_tx.clone();
+            let response_tx = response_tx.clone();
             move || -> Result<()> {
                 let mut client = curl::easy::Easy::new();
                 loop {
                     let now = time::Instant::now();
-                    let duration = match endpoint.send_request(&mut client) {
-                        Ok(_) => Ok(now.elapsed()),
-                        Err(err) => Err(err),
-                    };
-                    if let Err(_) = request_tx.send(duration) {
+                    let response = endpoint.send_request(&mut client).map(|v| Response {
+                        status: v as usize,
+                        duration: now.elapsed(),
+                    });
+                    if let Err(_) = response_tx.send(response) {
                         break;
                     }
                 }
@@ -385,10 +424,10 @@ fn main() -> Result<()> {
         if start_instant.elapsed() > cmd_args.duration {
             break;
         }
-        let request = request_rx.recv()??;
-        statistics.lock().unwrap().track(request);
+        let response = response_rx.recv()??;
+        statistics.lock().unwrap().track(response);
     }
-    drop(request_rx);
+    drop(response_rx);
 
     eprintln!("\n{}", statistics.lock().unwrap());
     eprintln!("waiting for threads to settle");
