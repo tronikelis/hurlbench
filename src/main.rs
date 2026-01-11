@@ -2,8 +2,8 @@ use std::{
     cmp,
     collections::BinaryHeap,
     env, fmt, fs,
-    io::{self, Write},
-    sync, thread, time,
+    io::{self, Read, Write},
+    ptr, sync, thread, time,
 };
 
 use anyhow::{Result, anyhow};
@@ -25,12 +25,37 @@ OPTIONS:
                                   [default: 1]
 ";
 
+#[derive(Debug)]
+struct ByteReader<'a> {
+    index: usize,
+    slice: &'a [u8],
+}
+
+impl<'a> ByteReader<'a> {
+    fn new(slice: &'a [u8]) -> Self {
+        Self { slice, index: 0 }
+    }
+}
+
+impl<'a> io::Read for ByteReader<'a> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.index >= self.slice.len() {
+            return Ok(0);
+        }
+
+        let copied = self.slice.len().min(buf.len());
+        unsafe { ptr::copy_nonoverlapping(self.slice.as_ptr(), buf.as_mut_ptr(), copied) };
+        self.index += buf.len();
+        Ok(copied)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Endpoint {
     url: String,
     headers: Vec<(String, String)>,
     method: String,
-    body: Option<()>,
+    body: Option<Vec<u8>>,
 }
 
 fn resolve_template(template: &hurl_core::ast::Template) -> String {
@@ -51,6 +76,50 @@ fn resolve_template(template: &hurl_core::ast::Template) -> String {
     string
 }
 
+fn resolve_json_value(json_value: &hurl_core::ast::JsonValue) -> String {
+    match json_value {
+        hurl_core::ast::JsonValue::Null => "null".to_string(),
+        hurl_core::ast::JsonValue::Number(v) => v.clone(),
+        hurl_core::ast::JsonValue::Boolean(bool) => {
+            (if *bool { "true" } else { "false" }).to_string()
+        }
+        hurl_core::ast::JsonValue::String(template) => {
+            format!("\"{}\"", resolve_template(&template).replace("\"", "\\\""))
+        }
+        hurl_core::ast::JsonValue::Placeholder(_) => todo!("variable support"),
+        hurl_core::ast::JsonValue::List {
+            space0: _space0,
+            elements,
+        } => {
+            let mut string = "[".to_string();
+            for (index, element) in elements.iter().enumerate() {
+                string.push_str(&resolve_json_value(&element.value));
+                if index != elements.len() - 1 {
+                    string.push(',');
+                }
+            }
+            string.push(']');
+            string
+        }
+        hurl_core::ast::JsonValue::Object {
+            space0: _space0,
+            elements,
+        } => {
+            let mut string = "{".to_string();
+            for (index, element) in elements.iter().enumerate() {
+                string.push_str(&resolve_template(&element.name));
+                string.push(':');
+                string.push_str(&resolve_json_value(&element.value));
+                if index != elements.len() - 1 {
+                    string.push(',');
+                }
+            }
+            string.push('}');
+            string
+        }
+    }
+}
+
 impl Endpoint {
     fn new(entry: &hurl_core::ast::Entry) -> Self {
         let url = resolve_template(&entry.request.url);
@@ -66,10 +135,18 @@ impl Endpoint {
             })
             .collect();
 
+        let body = entry.request.body.as_ref().map(|body| match &body.value {
+            hurl_core::ast::Bytes::Json(json_value) => {
+                let result = resolve_json_value(json_value);
+                result.into_bytes()
+            }
+            _ => todo!("this body not yet supported"),
+        });
+
         Self {
             url,
             headers,
-            body: None,
+            body,
             method: entry.request.method.to_string(),
         }
     }
@@ -83,6 +160,7 @@ impl Endpoint {
     }
 
     fn send_request(&self, client: &mut curl::easy::Easy) -> Result<u32> {
+        client.reset();
         client.url(&self.url)?;
         client.http_headers(self.create_header_list()?)?;
         match self.method.as_str() {
@@ -92,7 +170,18 @@ impl Endpoint {
             _ => todo!("unknown method handle"),
         }?;
 
-        client.perform()?;
+        {
+            let mut transfer = client.transfer();
+            if let Some(body) = &self.body {
+                let mut reader = ByteReader::new(body);
+                transfer.read_function(move |data| Ok(reader.read(data).unwrap()))?;
+                transfer.write_function(|data| {
+                    // noop
+                    Ok(data.len())
+                })?;
+            }
+            transfer.perform()?;
+        }
         Ok(client.response_code()?)
     }
 }
