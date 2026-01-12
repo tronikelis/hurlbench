@@ -13,9 +13,11 @@ ARGS:
 
 OPTIONS:
     -d, --duration <DURATION>      Duration with unit suffix:
-                                  s = seconds, m = milliseconds
-                                  [default: 10s]
+                                   s = seconds, m = milliseconds
+                                   [default: 10s]
 
     -p, --parallelism <N>          Number of parallel workers
-                                  [default: 1]
+                                   [default: 1]
+
+    -v, --variable <KEY>=<VALUE>   Pass variables to be expanded
 ```

@@ -18,12 +18,20 @@ ARGS:
 
 OPTIONS:
     -d, --duration <DURATION>      Duration with unit suffix:
-                                  s = seconds, m = milliseconds
-                                  [default: 10s]
+                                   s = seconds, m = milliseconds
+                                   [default: 10s]
 
     -p, --parallelism <N>          Number of parallel workers
-                                  [default: 1]
+                                   [default: 1]
+
+    -v, --variable <KEY>=<VALUE>   Pass variables to be expanded
 ";
+
+#[derive(Debug, Clone)]
+struct Variable {
+    key: String,
+    value: String,
+}
 
 #[derive(Debug)]
 struct ByteReader<'a> {
@@ -58,97 +66,147 @@ struct Endpoint {
     body: Option<Vec<u8>>,
 }
 
-fn resolve_template(template: &hurl_core::ast::Template) -> String {
-    let mut string = String::new();
+#[derive(Debug, Clone)]
+struct TemplateResolver {
+    variables: Vec<Variable>,
+}
 
-    for element in &template.elements {
-        match element {
-            hurl_core::ast::TemplateElement::String {
-                value,
-                source: _source,
-            } => string.push_str(&value),
-            hurl_core::ast::TemplateElement::Placeholder(_placeholder) => {
-                todo!("placeholders not supported yet");
-            }
+impl TemplateResolver {
+    fn new(variables: Vec<Variable>) -> Self {
+        Self { variables }
+    }
+
+    fn resolve_placeholder(&self, placeholder: &hurl_core::ast::Placeholder) -> Result<String> {
+        match &placeholder.expr.kind {
+            hurl_core::ast::ExprKind::Variable(variable) => self
+                .variables
+                .iter()
+                .find(|v| &v.key == &variable.name)
+                .map(|v| v.value.clone())
+                .ok_or_else(|| anyhow!("variable: {} not found", &variable.name)),
+            _ => Err(anyhow!("this expression type is not supported")),
         }
     }
 
-    string
+    fn resolve(&self, template: &hurl_core::ast::Template) -> Result<String> {
+        let mut string = String::new();
+
+        for element in &template.elements {
+            match element {
+                hurl_core::ast::TemplateElement::String {
+                    value,
+                    source: _source,
+                } => string.push_str(value),
+                hurl_core::ast::TemplateElement::Placeholder(placeholder) => {
+                    string.push_str(&self.resolve_placeholder(placeholder)?);
+                }
+            }
+        }
+
+        Ok(string)
+    }
 }
 
-fn resolve_json_value(json_value: &hurl_core::ast::JsonValue) -> String {
-    match json_value {
-        hurl_core::ast::JsonValue::Null => "null".to_string(),
-        hurl_core::ast::JsonValue::Number(v) => v.clone(),
-        hurl_core::ast::JsonValue::Boolean(bool) => {
-            (if *bool { "true" } else { "false" }).to_string()
-        }
-        hurl_core::ast::JsonValue::String(template) => {
-            format!("\"{}\"", resolve_template(&template).replace("\"", "\\\""))
-        }
-        hurl_core::ast::JsonValue::Placeholder(_) => todo!("variable support"),
-        hurl_core::ast::JsonValue::List {
-            space0: _space0,
-            elements,
-        } => {
-            let mut string = "[".to_string();
-            for (index, element) in elements.iter().enumerate() {
-                string.push_str(&resolve_json_value(&element.value));
-                if index != elements.len() - 1 {
-                    string.push(',');
-                }
+#[derive(Debug)]
+struct JsonResolver {
+    template_resolver: TemplateResolver,
+}
+
+impl JsonResolver {
+    fn new(template_resolver: TemplateResolver) -> Self {
+        Self { template_resolver }
+    }
+
+    fn resolve(&self, json_value: &hurl_core::ast::JsonValue) -> Result<String> {
+        Ok(match json_value {
+            hurl_core::ast::JsonValue::Null => "null".to_string(),
+            hurl_core::ast::JsonValue::Number(v) => v.clone(),
+            hurl_core::ast::JsonValue::Boolean(bool) => {
+                (if *bool { "true" } else { "false" }).to_string()
             }
-            string.push(']');
-            string
-        }
-        hurl_core::ast::JsonValue::Object {
-            space0: _space0,
-            elements,
-        } => {
-            let mut string = "{".to_string();
-            for (index, element) in elements.iter().enumerate() {
-                string.push_str(&resolve_template(&element.name));
-                string.push(':');
-                string.push_str(&resolve_json_value(&element.value));
-                if index != elements.len() - 1 {
-                    string.push(',');
-                }
+            hurl_core::ast::JsonValue::String(template) => {
+                format!(
+                    "\"{}\"",
+                    self.template_resolver
+                        .resolve(&template)?
+                        .replace("\"", "\\\"")
+                )
             }
-            string.push('}');
-            string
-        }
+            hurl_core::ast::JsonValue::Placeholder(placeholder) => {
+                self.template_resolver.resolve_placeholder(placeholder)?
+            }
+            hurl_core::ast::JsonValue::List {
+                space0: _space0,
+                elements,
+            } => {
+                let mut string = "[".to_string();
+                for (index, element) in elements.iter().enumerate() {
+                    string.push_str(&self.resolve(&element.value)?);
+                    if index != elements.len() - 1 {
+                        string.push(',');
+                    }
+                }
+                string.push(']');
+                string
+            }
+            hurl_core::ast::JsonValue::Object {
+                space0: _space0,
+                elements,
+            } => {
+                let mut string = "{".to_string();
+                for (index, element) in elements.iter().enumerate() {
+                    string.push_str(&self.template_resolver.resolve(&element.name)?);
+                    string.push(':');
+                    string.push_str(&self.resolve(&element.value)?);
+                    if index != elements.len() - 1 {
+                        string.push(',');
+                    }
+                }
+                string.push('}');
+                string
+            }
+        })
     }
 }
 
 impl Endpoint {
-    fn new(entry: &hurl_core::ast::Entry) -> Self {
-        let url = resolve_template(&entry.request.url);
+    fn new(
+        template_resolver: &TemplateResolver,
+        json_resolver: &JsonResolver,
+        entry: &hurl_core::ast::Entry,
+    ) -> Result<Self> {
+        let url = template_resolver.resolve(&entry.request.url)?;
         let headers = entry
             .request
             .headers
             .iter()
             .map(|key_value| {
-                (
-                    resolve_template(&key_value.key),
-                    resolve_template(&key_value.value),
-                )
+                Ok((
+                    template_resolver.resolve(&key_value.key)?,
+                    template_resolver.resolve(&key_value.value)?,
+                ))
             })
-            .collect();
+            .collect::<Result<_>>()?;
 
-        let body = entry.request.body.as_ref().map(|body| match &body.value {
-            hurl_core::ast::Bytes::Json(json_value) => {
-                let result = resolve_json_value(json_value);
-                result.into_bytes()
-            }
-            _ => todo!("this body not yet supported"),
-        });
+        let body = entry
+            .request
+            .body
+            .as_ref()
+            .map(|body| match &body.value {
+                hurl_core::ast::Bytes::Json(json_value) => {
+                    let result = json_resolver.resolve(json_value)?;
+                    Ok(result.into_bytes())
+                }
+                _ => Err(anyhow!("this body is not yet supported")),
+            })
+            .transpose()?;
 
-        Self {
+        Ok(Self {
             url,
             headers,
             body,
             method: entry.request.method.to_string(),
-        }
+        })
     }
 
     fn create_header_list(&self) -> Result<curl::easy::List> {
@@ -207,6 +265,7 @@ struct CmdArgs {
     parrallelism: usize,
     duration: time::Duration,
     filepath: String,
+    variables: Vec<Variable>,
 }
 
 impl CmdArgs {
@@ -214,6 +273,7 @@ impl CmdArgs {
         let mut duration = None;
         let mut parallelism = None;
         let mut filepath = None;
+        let mut variables = Vec::new();
 
         let missing_argument = || anyhow!("missing argument");
         let mut args = env::args().skip(1);
@@ -247,6 +307,16 @@ impl CmdArgs {
                 "-p" | "--parallelism" => {
                     parallelism = Some(args.next().ok_or_else(missing_argument)?.parse()?);
                 }
+                "-v" | "--variable" => {
+                    let definition = args.next().ok_or_else(missing_argument)?;
+                    let mut by_equals = definition.split("=");
+                    let key = by_equals.next().ok_or_else(missing_argument)?;
+                    let value = by_equals.next().ok_or_else(missing_argument)?;
+                    variables.push(Variable {
+                        key: key.to_string(),
+                        value: value.to_string(),
+                    });
+                }
                 v => filepath = Some(v.to_string()),
             };
         }
@@ -255,6 +325,7 @@ impl CmdArgs {
             duration: duration.unwrap_or(time::Duration::from_secs(10)),
             parrallelism: parallelism.unwrap_or(1),
             filepath: filepath.ok_or_else(missing_argument)?,
+            variables,
         })
     }
 }
@@ -445,12 +516,17 @@ fn main() -> Result<()> {
         )
     })?;
 
+    let template_resolver = TemplateResolver::new(cmd_args.variables.clone());
+    let json_resolver = JsonResolver::new(template_resolver.clone());
+
     let endpoint = Endpoint::new(
+        &template_resolver,
+        &json_resolver,
         hurl_file
             .entries
             .get(0)
             .ok_or_else(|| anyhow!("expected hurl file to have an entry"))?,
-    );
+    )?;
     eprintln!("endpoint: {}", &endpoint);
 
     let (response_tx, response_rx) = sync::mpsc::channel::<Result<Response>>();
