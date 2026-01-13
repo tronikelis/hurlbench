@@ -561,27 +561,27 @@ fn main() -> Result<()> {
         let statistics = statistics.clone();
         move || -> Result<()> {
             let mut stderr = io::stderr();
-            write!(stderr, "\x1b[s")?;
 
             let mut prev_request_count: usize = 0;
             let mut prev_instant = time::Instant::now();
             loop {
-                write!(stderr, "\x1b[u\x1b[0J")?;
                 let current_request_count = statistics.lock().unwrap().request_count();
                 let rps = ((current_request_count - prev_request_count) as f32)
                     / prev_instant.elapsed().as_secs_f32();
 
                 prev_instant = time::Instant::now();
                 prev_request_count = current_request_count;
-                write!(
-                    stderr,
-                    "({:.1}/{:.1}) [{}rps]\n{}\n",
+                let printed_string = format!(
+                    "({:.1}/{:.1}) [{}rps]\n{}",
                     start_instant.elapsed().as_secs_f32(),
                     cmd_args.duration.as_secs_f32(),
                     rps as usize,
                     statistics.lock().unwrap()
-                )?;
+                );
+                write!(stderr, "{}", &printed_string)?;
                 thread::sleep(time::Duration::from_secs(1));
+                // up N lines, move cursor to first column, clear till end of screen
+                write!(stderr, "\x1b[{}A\r\x1b[0J", printed_string.lines().count())?;
             }
         }
     });
