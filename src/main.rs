@@ -595,7 +595,6 @@ fn main() -> Result<()> {
     }
     drop(response_rx);
 
-    eprintln!("\n{}", statistics.lock().unwrap());
     eprintln!("waiting for threads to settle");
     for thread_handle in thread_handles {
         thread_handle.join().unwrap()?;
