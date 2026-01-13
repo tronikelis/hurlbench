@@ -117,6 +117,10 @@ impl JsonResolver {
         Self { template_resolver }
     }
 
+    fn quote(string: &str) -> String {
+        format!("\"{}\"", string.replace("\"", "\\\""))
+    }
+
     fn resolve(&self, json_value: &hurl_core::ast::JsonValue) -> Result<String> {
         Ok(match json_value {
             hurl_core::ast::JsonValue::Null => "null".to_string(),
@@ -125,12 +129,7 @@ impl JsonResolver {
                 (if *bool { "true" } else { "false" }).to_string()
             }
             hurl_core::ast::JsonValue::String(template) => {
-                format!(
-                    "\"{}\"",
-                    self.template_resolver
-                        .resolve(&template)?
-                        .replace("\"", "\\\"")
-                )
+                Self::quote(&self.template_resolver.resolve(template)?)
             }
             hurl_core::ast::JsonValue::Placeholder(placeholder) => {
                 self.template_resolver.resolve_placeholder(placeholder)?
@@ -155,7 +154,9 @@ impl JsonResolver {
             } => {
                 let mut string = "{".to_string();
                 for (index, element) in elements.iter().enumerate() {
-                    string.push_str(&self.template_resolver.resolve(&element.name)?);
+                    string.push_str(&Self::quote(
+                        &self.template_resolver.resolve(&element.name)?,
+                    ));
                     string.push(':');
                     string.push_str(&self.resolve(&element.value)?);
                     if index != elements.len() - 1 {
